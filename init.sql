@@ -22,7 +22,6 @@ CREATE TABLE devices (
 CREATE TABLE vaults (
     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     encrypted_blob BYTEA NOT NULL,
-    version INT NOT NULL DEFAULT 1,
     last_updated_by_device_id UUID REFERENCES devices(id),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

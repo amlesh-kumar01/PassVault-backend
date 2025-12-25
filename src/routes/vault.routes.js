@@ -3,20 +3,16 @@ const pool = require('../config/db');
 const auth = require('../middleware/auth.middleware');
 const router = express.Router();
 
-// SYNC (PUSH)
+// SYNC (TWO-WAY)
 router.post('/sync', auth, async (req, res) => {
-  const { encryptedBlob, version } = req.body; // encryptedBlob is expected to be a buffer-like array or hex string from JSON? 
-  // Postgres BYTEA accepts hex format (starting with \x) or base64? 
-  // Let's assume the client sends it as a regular JSON array or base64 string.
-  // Actually, for simplicity with node-postgres, passing a Buffer object or bytea hex string works.
-  // If `encryptedBlob` comes as {0: 23, 1: ...} (JSON object of array), we need to handle it.
-  // Best to expect Base64 string or convert client-side. 
-  // For this implementation, let's assume the body has standard JSON fields.
+  const { encryptedBlob, lastModified } = req.body; // lastModified is ISO timestamp or Unix timestamp in ms
   
-
-  if (encryptedBlob === undefined || version === undefined) {
+  if (encryptedBlob === undefined || lastModified === undefined) {
     return res.status(400).json({ message: 'Missing fields' });
   }
+
+  // Convert to Date object for comparison
+  const clientTimestamp = new Date(lastModified);
 
   const client = await pool.pool.connect();
 
@@ -25,50 +21,56 @@ router.post('/sync', auth, async (req, res) => {
 
     // Get current vault state
     const currentRes = await client.query(
-      'SELECT version FROM vaults WHERE user_id = $1 FOR UPDATE',
+      'SELECT encrypted_blob, updated_at FROM vaults WHERE user_id = $1 FOR UPDATE',
       [req.user.user_id]
     );
 
-    let currentVersion = 0;
+    let serverTimestamp = null;
     if (currentRes.rows.length > 0) {
-      currentVersion = currentRes.rows[0].version;
+      serverTimestamp = new Date(currentRes.rows[0].updated_at);
     }
 
-    // Conflict Logic
-    // If incoming > current OR current is null (0), Update.
-    // If incoming <= current, Conflict.
+    // Two-way sync logic based on timestamps:
+    // 1. If client timestamp > server timestamp: Server updates with client data
+    // 2. If server timestamp > client timestamp: Return server data to client
+    // 3. If timestamps are equal: No update needed
 
-    if (version > currentVersion || currentRes.rows.length === 0) {
-      // Update or Insert
+    if (!serverTimestamp || clientTimestamp > serverTimestamp) {
+      // Client has newer data - Update server
       const query = `
-        INSERT INTO vaults (user_id, encrypted_blob, version, last_updated_by_device_id)
+        INSERT INTO vaults (user_id, encrypted_blob, last_updated_by_device_id, updated_at)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (user_id)
         DO UPDATE SET
           encrypted_blob = EXCLUDED.encrypted_blob,
-          version = EXCLUDED.version,
           last_updated_by_device_id = EXCLUDED.last_updated_by_device_id,
-          updated_at = CURRENT_TIMESTAMP
+          updated_at = EXCLUDED.updated_at
       `;
-      
-      // We need to ensure encryptedBlob is in a format Postgres accepts for BYTEA. 
-      // If it comes as an array of numbers (from Uint8Array JSON.stringify), we can Buffer.from(encryptedBlob).
-      // We'll rely on the controller to receive it correctly.
       
       await client.query(query, [
         req.user.user_id, 
         Buffer.from(encryptedBlob), 
-        version, 
-        req.user.device_id
+        req.user.device_id,
+        clientTimestamp
       ]);
 
       await client.query('COMMIT');
-      return res.json({ success: true, newVersion: version });
+      return res.json({ success: true, action: 'updated', lastModified: clientTimestamp.toISOString() });
+
+    } else if (clientTimestamp < serverTimestamp) {
+      // Server has newer data - Return server data to client
+      await client.query('COMMIT');
+      return res.json({ 
+        success: true, 
+        action: 'pull_required',
+        encrypted_blob: currentRes.rows[0].encrypted_blob, 
+        lastModified: serverTimestamp.toISOString()
+      });
 
     } else {
-      // Conflict
-      await client.query('ROLLBACK');
-      return res.status(409).json({ code: 'CONFLICT', serverVersion: currentVersion });
+      // Timestamps are equal - Already in sync
+      await client.query('COMMIT');
+      return res.json({ success: true, action: 'up_to_date', lastModified: serverTimestamp.toISOString() });
     }
 
   } catch (err) {
@@ -84,20 +86,23 @@ router.post('/sync', auth, async (req, res) => {
 router.get('/pull', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT encrypted_blob, version FROM vaults WHERE user_id = $1',
+      'SELECT encrypted_blob, updated_at FROM vaults WHERE user_id = $1',
       [req.user.user_id]
     );
 
     if (result.rows.length === 0) {
         // No vault yet, return empty/null
-      return res.json({ encrypted_blob: null, version: 0 });
+      return res.json({ encrypted_blob: null, lastModified: null });
     }
 
     const row = result.rows[0];
     // encrypted_blob returned by pg is a Buffer. 
     // We send it back as JSON (which turns Buffer into {type:'Buffer', data:[...]}).
     // Client needs to handle this.
-    res.json({ encrypted_blob: row.encrypted_blob, version: row.version });
+    res.json({ 
+      encrypted_blob: row.encrypted_blob, 
+      lastModified: row.updated_at.toISOString() 
+    });
 
   } catch (err) {
     console.error(err);
